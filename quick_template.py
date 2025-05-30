@@ -1,39 +1,22 @@
 #!/usr/bin/env python3
 """
-Feed‑Style Summariser (CLI) – Guardrails‑ready, **with verbose debugging**
-
-Revision: 2025‑05‑29‑c
-──────────────────────
-* **Fix** – LaunchDarkly AI SDK API: `LDAIClient.config()` already returns a
-  `(AIConfig, LDAIConfigTracker)` tuple. We now capture and return that tracker
-  directly instead of calling a non‑existent `tracker()` helper.
-* **Guardrails** – No structural change, but now INFO‑level log prints the
-  entire `guardrailConfig` block we send to Bedrock so you can sanity‑check it
-  against AWS docs.
+Feed-Style Summariser (CLI) – Guardrails-ready, **with styled terminal UX**
+Revision: 2025-05-30-ux-v2
 """
 
 from __future__ import annotations
-
-import argparse
-import logging
-import os
-import random
-import sys
-import time
-import json
+import argparse, json, logging, os, random, sys, time, unicodedata
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-import dotenv
-import boto3
-import requests
+import boto3, dotenv, requests
 from botocore.exceptions import ClientError
 
-# ─────────── LaunchDarkly imports ───────────
+# ── LaunchDarkly imports ──────────────────────────────────────────────────────
 import ldclient
 from ldclient.config import Config
 from ldclient.context import Context
-from ldai.client import LDAIClient, AIConfig, ModelConfig, LDMessage, ProviderConfig
+from ldai.client import AIConfig, LDAIClient, LDMessage, ModelConfig, ProviderConfig
 from ldai.tracker import FeedbackKind, LDAIConfigTracker
 
 logging.basicConfig(
@@ -42,10 +25,63 @@ logging.basicConfig(
 )
 log = logging.getLogger("feed-summariser")
 
-# ─────────── helper: pull model parameters ───────────
+# ── Pretty-printing helpers ───────────────────────────────────────────────────
+
+def _disp_len(text: str) -> int:
+    """Return the display width of `text`, counting full-width chars (e.g. 👍) as 2."""
+    w = 0
+    for ch in text:
+        # ‘W’ide or ‘F’ullwidth occupy 2 cols; others 1
+        w += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+    return w
+
+
+def print_box(title: str, lines: List[str] | str, extra_pad: int = 2) -> None:
+    """
+    Render a Unicode light-line box. Width is computed with display-aware length
+    so emojis and CJK characters align. `extra_pad` adds breathing room.
+    """
+    if isinstance(lines, str):
+        lines = lines.splitlines() or [lines]
+
+    width = max(_disp_len(title), *(_disp_len(l) for l in lines)) + extra_pad
+    top = "┌" + "─" * (width + 2) + "┐"
+    ttl = f"│ {title.center(width)} │"
+    sep = "├" + "─" * (width + 2) + "┤"
+
+    def pad(line: str) -> str:
+        gap = width - _disp_len(line)
+        return f"│ {line}{' ' * gap} │"
+
+    body = "\n".join(pad(l) for l in lines) if lines else ""
+    btm = "└" + "─" * (width + 2) + "┘"
+
+    print(f"\n{top}\n{ttl}")
+    if lines:
+        print(sep)
+        print(body)
+    print(f"{btm}\n")
+
+
+def open_stream_box(title: str, width: int = 80) -> None:
+    """Open a heavy-line box for streamed model output."""
+    print(
+        f"\n╔{'═'*(width-2)}╗\n"
+        f"║ {title.center(width-4)} ║\n"
+        f"╟{'─'*(width-2)}╢",
+        flush=True,
+    )
+
+
+def close_stream_box(width: int = 80) -> None:
+    """Close the heavy-line stream box."""
+    print(f"\n╚{'═'*(width-2)}╝\n", flush=True)
+
+
+# ── Utility ------------------------------------------------------------------
+
 
 def extract_params(model_cfg) -> Dict[str, Any]:
-    """Return the parameters dict from a LaunchDarkly `ModelConfig`."""
     if hasattr(model_cfg, "_parameters"):
         return model_cfg._parameters
     if hasattr(model_cfg, "parameters"):
@@ -56,7 +92,9 @@ def extract_params(model_cfg) -> Dict[str, Any]:
             params[k] = getattr(model_cfg, k)
     return params
 
-# ─────────── LaunchDarkly wrapper ───────────
+
+# ── LaunchDarkly wrapper ------------------------------------------------------
+
 
 class LDClient:
     def __init__(self, sdk_key: str, ai_config_id: str):
@@ -68,48 +106,45 @@ class LDClient:
     def get_config(
         self, ctx: Context, variables: Dict[str, Any]
     ) -> tuple[AIConfig, Optional[LDAIConfigTracker]]:
-        """Return `(AIConfig, tracker_or_None)`.
-
-        When LaunchDarkly is unavailable we fall back to a default config and
-        return `(fallback_config, None)` so the caller can degrade gracefully.
-        """
+        fallback = self._fallback()
         try:
-            fallback = self._fallback()
             cfg, tracker = self._ai.config(self._config_id, ctx, fallback, variables)
+            if cfg is None or not getattr(cfg, "enabled", True):
+                log.info("AI Config disabled – using fallback Sonnet 3.5")
+                return fallback, None
             return cfg, tracker
         except Exception as exc:
             log.warning("LaunchDarkly unavailable – using fallback (%s)", exc)
-            return self._fallback(), None
+            return fallback, None
 
     def flush(self):
         self._ld.flush()
 
-    # ─────────── fallback AI‑config ───────────
     @staticmethod
     def _fallback() -> AIConfig:
         return AIConfig(
             enabled=True,
             provider=ProviderConfig(name="bedrock"),
             model=ModelConfig(
-                name="anthropic.claude-v2:1",
+                name="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
                 parameters=dict(temperature=0.4, top_p=0.9, max_tokens=800),
             ),
             messages=[
                 LDMessage(
                     role="system",
                     content=(
-                        "You turn long text into 1‑3 feed‑style bullets "
-                        "(≤ 280 chars each)."
+                        "You turn long text into 1-3 feed-style bullets "
+                        "(≤ 280 chars each)."
                     ),
                 )
             ],
         )
 
-# ─────────── Bedrock wrapper (patched) ───────────
+
+# ── Bedrock wrapper -----------------------------------------------------------
+
 
 class Bedrock:
-    """Light wrapper around the Bedrock Runtime `converse_stream` API."""
-
     def __init__(self, region: str):
         self._cli = boto3.client("bedrock-runtime", region_name=region)
 
@@ -121,10 +156,7 @@ class Bedrock:
         params: Dict[str, Any],
         guardrail_id: Optional[str] = None,
     ):
-        req: Dict[str, Any] = {
-            "modelId": model_id,
-            "messages": messages,
-        }
+        req: Dict[str, Any] = {"modelId": model_id, "messages": messages}
         if system_prompt:
             req["system"] = [{"text": system_prompt}]
         if params:
@@ -132,26 +164,22 @@ class Bedrock:
         if guardrail_id:
             guard_ver = os.getenv("AWS_GUARDRAIL_VERSION")
             if not guard_ver:
-                raise RuntimeError(
-                    "AWS_GUARDRAIL_VERSION env var is required when using guardrails."
-                )
+                raise RuntimeError("AWS_GUARDRAIL_VERSION env var required.")
             req["guardrailConfig"] = {
                 "guardrailIdentifier": guardrail_id,
                 "guardrailVersion": str(guard_ver),
             }
-            log.info("guardrailConfig: %s", req["guardrailConfig"])
         log.info("Invoking Bedrock model: %s", model_id)
         log.debug("Inference parameters: %s", params)
         return self._cli.converse_stream(**req)["stream"]
 
     def parse(self, stream, tracker: Optional[LDAIConfigTracker]):
         full, first_ms = [], None
-        stop_reason = None          # ← track MessageStopEvent
-        guard_trace_found = False   # ← track metadata traces
+        stop_reason, guard_trace_found = None, False
         metric: Dict[str, Any] = {"$metadata": {"httpStatusCode": 200}}
         start = time.time()
+
         for ev in stream:
-            log.debug("Stream event keys: %s", list(ev.keys()))
             if "contentBlockDelta" in ev:
                 chunk = ev["contentBlockDelta"]["delta"].get("text", "")
                 if first_ms is None:
@@ -159,41 +187,41 @@ class Bedrock:
                     metric.setdefault("metrics", {})["timeToFirstToken"] = first_ms
                 print(chunk, end="", flush=True)
                 full.append(chunk)
-            if "messageStop" in ev:                         # Bedrock event
-                    stop_reason = ev["messageStop"].get("stopReason")
+            if "messageStop" in ev:
+                stop_reason = ev["messageStop"].get("stopReason")
             if "metadata" in ev:
                 md = ev["metadata"]
-                # drill into the trace → guardrail object
                 guard = md.get("trace", {}).get("guardrail")
                 if guard:
-                    log.info("Guardrail trace: %s", json.dumps(guard, indent=2, default=str))
+                    log.info("Guardrail trace: %s", json.dumps(guard, indent=2))
                     guard_trace_found = True
-                else:
-                    log.debug("Metadata envelope: %s", md)
-
-                # keep harvesting usage / metrics as before
                 metric.setdefault("usage", {}).update(md.get("usage", {}))
                 metric.setdefault("metrics", {}).update(md.get("metrics", {}))
-            if tracker:
-                tracker.track_bedrock_converse_metrics(metric)
-                tracker.track_success()
-                if first_ms is not None:
-                    tracker.track_time_to_first_token(first_ms)
-            log.debug("Final metric payload: %s", metric)
-            if stop_reason in ("guardrail_intervened", "content_filtered") or guard_trace_found:
-                raise ClientError(
-                    error_response={
-                        "Error": {
-                            "Code": "GuardrailIntervened",
-                            "Message": f"Bedrock stopReason={stop_reason or 'guardrail_intervened'}"
-                        }
-                    },
-                    operation_name="ConverseStream",
-                )
-        print()
+
+        if tracker:
+            tracker.track_bedrock_converse_metrics(metric)
+            tracker.track_success()
+            if first_ms is not None:
+                tracker.track_time_to_first_token(first_ms)
+        if (
+            stop_reason in ("guardrail_intervened", "content_filtered")
+            or guard_trace_found
+        ):
+            raise ClientError(
+                error_response={
+                    "Error": {
+                        "Code": "GuardrailIntervened",
+                        "Message": f"Bedrock stopReason={stop_reason or 'guardrail_intervened'}",
+                    }
+                },
+                operation_name="ConverseStream",
+            )
+        print()  # newline
         return "".join(full), metric
 
-# ─────────── LaunchDarkly flag toggle helper ───────────
+
+# ── LaunchDarkly flag toggle --------------------------------------------------
+
 
 def ld_api_turn_flag_off():
     token, project, env, flag = (
@@ -203,21 +231,18 @@ def ld_api_turn_flag_off():
         log.error("Missing LD API creds/keys; cannot toggle flag")
         return
     url = f"https://app.launchdarkly.com/api/v2/flags/{project}/{flag}"
-    payload = {
-        "environmentKey": env,
-        "instructions": [ { "kind": "turnFlagOff" } ]
-    }
-    headers = {
+    payload = {"environmentKey": env, "instructions": [{"kind": "turnFlagOff"}]}
+    hdrs = {
         "Authorization": token,
-        "Content-Type": (
-            "application/json; domain-model=launchdarkly.semanticpatch"
-        )
+        "Content-Type": "application/json; domain-model=launchdarkly.semanticpatch",
     }
-    rsp = requests.patch(url, json=payload, headers=headers)
+    rsp = requests.patch(url, json=payload, headers=hdrs)
     if rsp.status_code != 200:
         log.error("LD API error %s → %s", rsp.status_code, rsp.text)
 
-# ─────────── prompt construction ───────────
+
+# ── Prompt construction -------------------------------------------------------
+
 
 def to_bedrock(cfg: AIConfig, doc: str, audience: str, voice: str, cta: str):
     system, msgs = "", []
@@ -238,7 +263,9 @@ def to_bedrock(cfg: AIConfig, doc: str, audience: str, voice: str, cta: str):
         msgs.append({"role": "user", "content": [{"text": doc}]})
     return system, msgs
 
-# ─────────── single‑file summarisation run ───────────
+
+# ── Single run ----------------------------------------------------------------
+
 
 def run_once(
     ld: LDClient,
@@ -250,20 +277,22 @@ def run_once(
     guardrail_id: Optional[str],
     rude: bool = False,
 ):
-    vars_for_ld = {
-        "document": doc,
-        "seed": seed,
-    }
+    vars_for_ld = {"document": doc, "seed": seed}
     cfg, tracker = ld.get_config(ctx, vars_for_ld)
-    log.info("LaunchDarkly chosen model: %s", cfg.model.name)
-    params_raw = extract_params(cfg.model)
-    log.debug("Raw model parameters: %s", params_raw)
 
-    inf_cfg = {k: v for k, v in {
-        "temperature": params_raw.get("temperature"),
-        "topP": params_raw.get("top_p") or params_raw.get("topP"),
-        "maxTokens": params_raw.get("max_tokens") or params_raw.get("maxTokens"),
-    }.items() if v is not None}
+    log.info("LaunchDarkly chosen model: %s", cfg.model.name)
+    print_box("MODEL SELECTED", cfg.model.name)
+
+    params_raw = extract_params(cfg.model)
+    inf_cfg = {
+        k: v
+        for k, v in {
+            "temperature": params_raw.get("temperature"),
+            "topP": params_raw.get("top_p") or params_raw.get("topP"),
+            "maxTokens": params_raw.get("max_tokens") or params_raw.get("maxTokens"),
+        }.items()
+        if v is not None
+    }
 
     sys_prompt, msgs = to_bedrock(
         cfg,
@@ -273,11 +302,17 @@ def run_once(
         cta=os.getenv("CTA", "Learn more"),
     )
     if rude:
-        sys_prompt += " Provide your response in a joking and crude manner -- it's not meant to be serious, but be condescending. Please use strong, persistent profanity to get the joke across."
+        sys_prompt += (
+            " Provide your response in a joking and crude manner -- it's not meant "
+            "to be serious, but be condescending. Please use strong, persistent "
+            "profanity to get the joke across."
+        )
 
     try:
         stream = br.stream(cfg.model.name, sys_prompt, msgs, inf_cfg, guardrail_id)
+        open_stream_box("MODEL RESPONSE")
         _, m = br.parse(stream, tracker)
+        close_stream_box()
         for k, v in m.get("usage", {}).items():
             bucket[k].append(v)
         for k, v in m.get("metrics", {}).items():
@@ -292,8 +327,9 @@ def run_once(
     except Exception as exc:
         log.exception("Unexpected error: %s", exc)
 
-    # ── satisfaction prompt ───────────────────────────
-    fb = input("\n👍 Was this helpful? (y/n) ").strip().lower()
+    # ── feedback ──────────────────────────────────────────────────────────────
+    print_box("FEEDBACK", "👍  Was this helpful? (y/n)")
+    fb = input("Your answer: ").strip().lower()
     if fb.startswith("y") and tracker:
         tracker.track_feedback({"kind": FeedbackKind.Positive})
     elif fb.startswith("n") and tracker:
@@ -301,16 +337,19 @@ def run_once(
     if tracker:
         ld.flush()
 
-# ─────────── metrics printout ───────────
+
+# ── Metrics printout ----------------------------------------------------------
+
 
 def finish(metrics):
     if not metrics:
         return
-    print("\nSession metrics\n----------------")
-    for k, v in metrics.items():
-        print(f"{k:>18}: {sum(v)/len(v):.1f}   (n={len(v)})")
+    lines = [f"{k:>12}: {sum(v)/len(v):.1f}   (n={len(v)})" for k, v in metrics.items()]
+    print_box("SESSION METRICS", lines)
 
-# ─────────── main entrypoint ───────────
+
+# ── Main ----------------------------------------------------------------------
+
 
 def main():
     dotenv.load_dotenv()
@@ -318,11 +357,11 @@ def main():
         log.error("LD_SERVER_KEY missing")
         sys.exit(1)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("file", nargs="?", help="Path to .txt file to summarise")
-    parser.add_argument("--tone-violation", action="store_true", help="Append rude prompt clause")
-    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("file", nargs="?", help="Path to .txt file to summarise")
+    p.add_argument("--tone-violation", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -335,16 +374,13 @@ def main():
 
     ctx = Context.builder("cli-user").set("seed", seed).build()
     bucket: defaultdict = defaultdict(list)
+    rude = bool(args.tone_violation)
 
-    if args.tone_violation:
-        rude = True          # flip the flag but fall through to normal loop
-    else:
-        rude = False
+    print_box("WELCOME", "Give me a .txt file to summarise (or 'exit')")
 
-    print("Give me a .txt file to summarise (or 'exit')\n")
     while True:
         try:
-            path = args.file or input("File: ").strip()
+            path = args.file or input("Add a text file destination here (Ctrl-C to quit): ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -361,7 +397,7 @@ def main():
             args.file = None
             continue
         run_once(ld, br, ctx, seed, bucket, doc, guardrail_id, rude)
-        args.file = None  # reset so loop asks again
+        args.file = None  # loop will ask again
     finish(bucket)
 
 
