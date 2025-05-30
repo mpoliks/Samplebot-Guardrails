@@ -245,8 +245,11 @@ def ld_api_turn_flag_off():
 
 
 def to_bedrock(cfg: AIConfig, doc: str, audience: str, voice: str, cta: str):
-    system, msgs = "", []
+    system, msgs, doc_already_embedded = "", [], False
     for i, m in enumerate(cfg.messages):
+        # Track whether the template itself will embed the document
+        if "{{document}}" in m.content or "{{document_chunk}}" in m.content:
+            doc_already_embedded = True
         role = "user" if m.role == "user" else "assistant"
         content = (
             m.content.replace("{{document_chunk}}", doc)
@@ -256,11 +259,12 @@ def to_bedrock(cfg: AIConfig, doc: str, audience: str, voice: str, cta: str):
             .replace("{{cta}}", cta)
         )
         if i == 0 and m.role == "system":
-            system = content
-            continue
+             system = content
+             continue
         msgs.append({"role": role, "content": [{"text": content}]})
-    if not any(msg["content"][0]["text"] == doc for msg in msgs):
-        msgs.append({"role": "user", "content": [{"text": doc}]})
+    # If the template already contains the full document, skip the extra message
+    if not doc_already_embedded:
+         msgs.append({"role": "user", "content": [{"text": doc}]})
     return system, msgs
 
 
